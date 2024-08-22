@@ -12,6 +12,7 @@ from sim_web_visualizer.base_visualizer_client import MeshCatVisualizerBase
 from bunny_teleop_server.communication.web_visualizer import TeleopWebVisualizer
 from bunny_teleop_server.nodes.bimanual_hand_monitor_node import run_hand_node
 from bunny_teleop_server.nodes.bimanual_teleop_server_node import BimanualRobotTeleopNode
+from bunny_teleop_server.nodes.single_teleop_server_node import SingleRobotTeleopNode
 from bunny_teleop_server.utils.camera_config import get_camera_config
 from bunny_teleop_server.utils.comminication_config import (
     CommunicationConfig,
@@ -60,6 +61,13 @@ def parse_args():
         type=int,
         help="The visualization server host port.",
     )
+    parser.add_argument(
+        "--arm-selection",
+        required=False,
+        default="both",
+        type=str,
+        help="If using a single (right or left) or both arms.",
+    )
     args = parser.parse_args()
     return args
 
@@ -77,8 +85,11 @@ def main():
         kinematics_path = kinematics_path.absolute()
     with kinematics_path.open("r") as f:
         yaml_config = yaml.load(f, Loader=yaml.FullLoader)
-        left_config = yaml_config["left"]
-        right_config = yaml_config["right"]
+        if args.arm_selection == "both":
+            left_config = yaml_config["left"]
+            right_config = yaml_config["right"]
+        else:
+            config = yaml_config[args.arm_selection]
 
     # Set retargeting directory
     root_dir = kinematics_path.parent.parent.parent.resolve().absolute()
@@ -90,19 +101,25 @@ def main():
     CommunicationConfig.set_default_asset_dir(urdf_dir)
 
     # Build motion control
-    motion_controls = []
-    retargetings = []
-    bimanual_control_configs = []
-    for i, cfg_dict in enumerate([left_config, right_config]):
-        control_config = MotionControlConfig.from_dict(cfg_dict["control"])
-        bimanual_control_configs.append(control_config)
-        motion_control = control_config.build() if control_config is not None else None
-        motion_controls.append(motion_control)
+    if args.arm_selection == "both":
+        motion_controls = []
+        retargetings = []
+        bimanual_control_configs = []
+        for i, cfg_dict in enumerate([left_config, right_config]):
+            control_config = MotionControlConfig.from_dict(cfg_dict["control"])
+            bimanual_control_configs.append(control_config)
+            motion_control = control_config.build() if control_config is not None else None
+            motion_controls.append(motion_control)
 
-        retargeting_config = RetargetingConfig.from_dict(cfg_dict["retargeting"])
+            retargeting_config = RetargetingConfig.from_dict(cfg_dict["retargeting"])
+            retargeting = retargeting_config.build()
+            retargetings.append(retargeting)
+    else:
+        control_config = MotionControlConfig.from_dict(config["control"])
+        motion_control = control_config.build() if config is not None else None
+        retargeting_config = RetargetingConfig.from_dict(config["retargeting"])
         retargeting = retargeting_config.build()
-        retargetings.append(retargeting)
-
+            
     # Parse camera config
     detection_topic_names = []
     hand_type = []
@@ -129,19 +146,34 @@ def main():
             start_zmq_server_as_subprocess()
 
             viz = MeshCatVisualizerBase(port=comm_cfg.viz_port, host=comm_cfg.viz_host)
-            left_robot_viz = TeleopWebVisualizer(
-                viz,
-                comm_cfg.operator_name,
-                is_right_hand=False,
-                robot_urdf_path=comm_cfg.viz_urdf_paths[0],
-            )
-            right_robot_viz = TeleopWebVisualizer(
-                viz,
-                comm_cfg.operator_name,
-                is_right_hand=True,
-                robot_urdf_path=comm_cfg.viz_urdf_paths[1],
-            )
-            robot_viz = (left_robot_viz, right_robot_viz)
+            if args.arm_selection == "both":
+                left_robot_viz = TeleopWebVisualizer(
+                    viz,
+                    comm_cfg.operator_name,
+                    is_right_hand=False,
+                    robot_urdf_path=comm_cfg.viz_urdf_paths[0],
+                )
+                right_robot_viz = TeleopWebVisualizer(
+                    viz,
+                    comm_cfg.operator_name,
+                    is_right_hand=True,
+                    robot_urdf_path=comm_cfg.viz_urdf_paths[1],
+                )
+                robot_viz = (left_robot_viz, right_robot_viz)
+            elif args.arm_selection == "left":
+                robot_viz = TeleopWebVisualizer(
+                    viz,
+                    comm_cfg.operator_name,
+                    is_right_hand=False,
+                    robot_urdf_path=comm_cfg.viz_urdf_paths[0],
+                )
+            else:
+                robot_viz = TeleopWebVisualizer(
+                    viz,
+                    comm_cfg.operator_name,
+                    is_right_hand=True,
+                    robot_urdf_path=comm_cfg.viz_urdf_paths[1],
+                )
         elif comm_cfg.viz_type == "vision_pro":
             raise NotImplementedError
             # avp_visualizers, grpc_server = setup_vision_pro_visualizer(comm_cfg)
@@ -153,26 +185,42 @@ def main():
 
     # Build teleportation node
     rclpy.init(args=None)
-    teleop_node = BimanualRobotTeleopNode(
-        detection_topic_name=detection_topic_names[0],
-        need_init=True,
-        retargeting_optimizers=(retargetings[0], retargetings[1]),
-        motion_controls=(motion_controls[0], motion_controls[1]),
-        robot_viz=robot_viz,
-        disable_orientation_control=tuple(
-            cfg.disable_orientation_control for cfg in bimanual_control_configs
-        ),
-        motion_scaling_factor=tuple(
-            cfg.motion_scaling_factor for cfg in bimanual_control_configs
-        ),
-        low_pass_smoothing_wrist=tuple(
-            cfg.low_pass_alpha for cfg in bimanual_control_configs
-        ),
-        verbose=True,
-        teleop_port=args.teleop_port,
-        teleop_host=args.teleop_host,
-    )
-
+    if args.arm_selection == "both":
+        teleop_node = BimanualRobotTeleopNode(
+            detection_topic_name=detection_topic_names[0],
+            need_init=True,
+            retargeting_optimizers=(retargetings[0], retargetings[1]),
+            motion_controls=(motion_controls[0], motion_controls[1]),
+            robot_viz=robot_viz,
+            disable_orientation_control=tuple(
+                cfg.disable_orientation_control for cfg in bimanual_control_configs
+            ),
+            motion_scaling_factor=tuple(
+                cfg.motion_scaling_factor for cfg in bimanual_control_configs
+            ),
+            low_pass_smoothing_wrist=tuple(
+                cfg.low_pass_alpha for cfg in bimanual_control_configs
+            ),
+            verbose=True,
+            teleop_port=args.teleop_port,
+            teleop_host=args.teleop_host,
+        )
+    else:
+        teleop_node = SingleRobotTeleopNode(
+            detection_topic_name=detection_topic_names[0],
+            hand_name=args.arm_selection + "_hand",
+            need_init=True,
+            retargeting_optimizer=retargeting,
+            motion_control=motion_control,
+            robot_viz=robot_viz,
+            disable_orientation_control=control_config.disable_orientation_control,
+            motion_scaling_factor=control_config.motion_scaling_factor,
+            low_pass_smoothing_wrist=control_config.low_pass_alpha,
+            verbose=True,
+            teleop_port=args.teleop_port,
+            teleop_host=args.teleop_host,
+        )
+    
     thread_num = 5
     run_hand_node(teleop_node, thread_num)
 
